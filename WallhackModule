@@ -921,6 +921,15 @@ local function UpdatePlayer(Player, State, LocalPosition)
 	local HeadPosition = Head and Head.Position or nil
 	local RootPosition = Root and Root.Position or nil
 
+	local isPrison = (game.PlaceId == 286090429 or game.GameId == 286090429)
+	if isPrison then
+		local pos = RootPosition or HeadPosition
+		if pos and (pos.Magnitude > 20000 or (pos - LocalPosition).Magnitude > 20000) then
+			HideState(State)
+			return
+		end
+	end
+
 	if not Screen then
 		HideState(State)
 		return
