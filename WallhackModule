@@ -204,12 +204,8 @@ local function FindPart(Character, Names)
 	local Key = Names[1]
 	local Entry = Cache[Key]
 
-	if Entry ~= nil then
-		if Entry == false then
-			return nil
-		end
-
-		if Entry.Parent then
+	if Entry and Entry.Parent then
+		if not Entry.IsDescendantOf or Entry:IsDescendantOf(Character) then
 			return Entry
 		end
 	end
@@ -231,7 +227,9 @@ local function FindPart(Character, Names)
 		end
 	end
 
-	Cache[Key] = Found or false
+	if Found then
+		Cache[Key] = Found
+	end
 
 	return Found
 end
@@ -1041,12 +1039,32 @@ local function UpdateAll()
 	local LocalRoot = LocalCharacter and FindPart(LocalCharacter, ROOT_NAMES)
 	local LocalPosition = LocalRoot and LocalRoot.Position or Camera.CFrame.Position
 
-	for Player, State in next, Environment.WrappedPlayers do
-		if Player.Parent then
+	-- Directly iterate all current players so newly joined players are registered immediately
+	local AllPlayers = Players:GetPlayers()
+	for _, Player in next, AllPlayers do
+		if Player ~= LocalPlayer then
+			local State = Environment.WrappedPlayers[Player] or GetState(Player)
 			UpdatePlayer(Player, State, LocalPosition)
-		else
+		end
+	end
+
+	-- Clean up players who left
+	for Player, State in next, Environment.WrappedPlayers do
+		if not Player.Parent then
 			Unwrap(Player)
 		end
+	end
+end
+
+local function TrackPlayer(Player)
+	if Player == LocalPlayer then return end
+	GetState(Player)
+	if Player.CharacterAdded then
+		Player.CharacterAdded:Connect(function(Character)
+			if Character then
+				partCache[Character] = nil
+			end
+		end)
 	end
 end
 
@@ -1054,17 +1072,10 @@ local function Load()
 	AddCrosshair()
 
 	for _, Player in next, Players:GetPlayers() do
-		if Player ~= LocalPlayer then
-			GetState(Player)
-		end
+		TrackPlayer(Player)
 	end
 
-	ServiceConnections.PlayerAddedConnection = Players.PlayerAdded:Connect(function(Player)
-		if Player ~= LocalPlayer then
-			GetState(Player)
-		end
-	end)
-
+	ServiceConnections.PlayerAddedConnection = Players.PlayerAdded:Connect(TrackPlayer)
 	ServiceConnections.PlayerRemovingConnection = Players.PlayerRemoving:Connect(Unwrap)
 	ServiceConnections.UpdateConnection = RunService.RenderStepped:Connect(UpdateAll)
 end
