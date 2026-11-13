@@ -169,76 +169,67 @@ end
 
 --// Native visibility
 
-local visibilityCache = setmetatable({}, { __mode = "k" })
-
-local SupportsRespectCanCollide = pcall(function()
-	local Probe = RaycastParams.new()
-	Probe.RespectCanCollide = true
-end)
-
-local function GetVisibilityParams(Character)
-	local Params = visibilityCache[Character]
-	local LocalCharacter = LocalPlayer and LocalPlayer.Character
-
-	-- Rebuild when the local character respawns: the cached filter would
-	-- otherwise miss the new local rig and the ray could hit ourselves.
-	if Params and Params._LocalCharacter == LocalCharacter then
-		return Params
-	end
-
-	Params = RaycastParams.new()
-	Params.FilterType = Enum.RaycastFilterType.Exclude
-	Params.IgnoreWater = true
-
-	if SupportsRespectCanCollide then
-		Params.RespectCanCollide = true
-	end
-
-	local Filter = { Character }
-
-	if LocalCharacter and LocalCharacter ~= Character then
-		Filter[#Filter + 1] = LocalCharacter
-	end
-
-	Params._LocalCharacter = LocalCharacter
-	Params.FilterDescendantsInstances = Filter
-	visibilityCache[Character] = Params
-
-	return Params
-end
-
 local function IsVisible(Character, Position, Origin)
 	if typeof(Character) ~= "Instance" or not Position then
 		return false
 	end
 
 	local CurrentCamera = Camera or workspace.CurrentCamera
-
-	if not Origin then
-		if not CurrentCamera then
-			return false
-		end
-
-		Origin = CurrentCamera.CFrame.Position
+	if not CurrentCamera then
+		return false
 	end
 
-	local Result = workspace:Raycast(Origin, Position - Origin, GetVisibilityParams(Character))
+	local TargetPos = Position
+	if typeof(Position) == "Instance" and Position:IsA("BasePart") then
+		TargetPos = Position.Position
+	elseif type(Position) == "table" and Position.Position then
+		TargetPos = Position.Position
+	end
 
+	local isVec3 = typeof(TargetPos) == "Vector3" or (type(TargetPos) == "table" and TargetPos.X ~= nil and TargetPos.Y ~= nil and TargetPos.Z ~= nil)
+	if not isVec3 then
+		return false
+	end
+
+	local LocalCharacter = LocalPlayer and LocalPlayer.Character
+	local IgnoreList = { Character, CurrentCamera }
+	if LocalCharacter then
+		IgnoreList[#IgnoreList + 1] = LocalCharacter
+	end
+
+	-- Engine Camera:GetPartsObscuringTarget ignores camera near-plane, viewmodels, transparency & non-collidable parts
+	local Ok, Obscuring = pcall(function()
+		return CurrentCamera:GetPartsObscuringTarget({ TargetPos }, IgnoreList)
+	end)
+
+	if Ok and type(Obscuring) == "table" then
+		for _, Part in ipairs(Obscuring) do
+			if Part:IsA("BasePart") and Part.CanCollide and Part.Transparency < 0.75 and not Part:IsDescendantOf(Character) and not (LocalCharacter and Part:IsDescendantOf(LocalCharacter)) then
+				return false
+			end
+		end
+		return true
+	end
+
+	-- Fallback: raycast
+	Origin = Origin or CurrentCamera.CFrame.Position
+	local Direction = TargetPos - Origin
+	local Params = RaycastParams.new()
+	Params.FilterType = Enum.RaycastFilterType.Exclude
+	Params.IgnoreWater = true
+	Params.FilterDescendantsInstances = IgnoreList
+
+	local Result = workspace:Raycast(Origin, Direction, Params)
 	if not Result then
 		return true
 	end
 
 	local Hit = Result.Instance
-
-	if Hit.Transparency >= 1 then
-		return true
+	if Hit and Hit.CanCollide and Hit.Transparency < 0.75 then
+		return false
 	end
 
-	if not SupportsRespectCanCollide and not Hit.CanCollide and not Hit:IsA("Terrain") then
-		return true
-	end
-
-	return false
+	return true
 end
 
 Environment.ResolvePart = ResolvePart
