@@ -1,1 +1,1247 @@
+--[[
 
+	Wall Hack Module [AirHub] by Exunys © CC0 1.0 Universal (2023)
+
+	https://github.com/Exunys
+
+	Improved by BeertjeOfficial:
+	- Custom rig support (recursive part lookup, case-insensitive names, fallbacks)
+	- One shared RenderStepped loop instead of one connection per feature per player
+	- Boss/ignored-player and CustomTeamCheck support (used by the hub)
+	- Native bounding-box ESP that works on any model, not just R6/R15
+	- Removed WaitForChild hangs, recursive AssignRigType, and the 30 second busy loop
+	- In-place ResetSettings so external references stay valid
+
+]]
+
+--// Cache
+
+local next, tostring, pcall, getgenv, setmetatable, type = next, tostring, pcall, getgenv, setmetatable, type
+local mathfloor, mathabs, mathmin, mathmax, mathcos, mathsin, mathrad, mathhuge = math.floor, math.abs, math.min, math.max, math.cos, math.sin, math.rad, math.huge
+local Vector2new, Vector3new, Drawingnew, Color3fromRGB = Vector2.new, Vector3.new, Drawing.new, Color3.fromRGB
+
+--// Launching checks
+
+if not getgenv().AirHub or getgenv().AirHub.WallHack then return end
+
+--// Services
+
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+--// Variables
+
+local ServiceConnections = {}
+
+local HEAD_NAMES = { "Head", "HeadHitbox", "Hitbox", "head" }
+local ROOT_NAMES = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Chest", "Body", "Root", "Hips" }
+
+local R6_CHAM_PARTS = { "Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }
+local R15_CHAM_PARTS_LIGHT = {
+	"Head", "UpperTorso",
+	"LeftLowerArm", "LeftUpperArm", "RightLowerArm", "RightUpperArm",
+	"LeftLowerLeg", "LeftUpperLeg", "RightLowerLeg", "RightUpperLeg"
+}
+local R15_CHAM_PARTS_FULL = {
+	"Head", "UpperTorso", "LowerTorso",
+	"LeftLowerArm", "LeftUpperArm", "LeftHand",
+	"RightLowerArm", "RightUpperArm", "RightHand",
+	"LeftLowerLeg", "LeftUpperLeg", "LeftFoot",
+	"RightLowerLeg", "RightUpperLeg", "RightFoot"
+}
+
+--// Environment
+
+getgenv().AirHub.WallHack = {
+	Settings = {
+		Enabled = false,
+		TeamCheck = false,
+		AliveCheck = true,
+		IgnoredPlayers = {},
+		CustomTeamCheck = nil
+	},
+
+	Visuals = {
+		ChamsSettings = {
+			Enabled = false,
+			TeamCheck = false,
+			Color = Color3fromRGB(255, 255, 255),
+			Transparency = 0.2,
+			Thickness = 0,
+			Filled = true,
+			EntireBody = false -- For R15, keep false to prevent lag
+		},
+
+		ESPSettings = {
+			Enabled = true,
+			TeamCheck = false,
+			TextColor = Color3fromRGB(255, 255, 255),
+			TextSize = 14,
+			Center = true,
+			Outline = true,
+			OutlineColor = Color3fromRGB(0, 0, 0),
+			TextTransparency = 0.7,
+			TextFont = Drawing.Fonts.UI, -- UI, System, Plex, Monospace
+			Offset = 20,
+			DisplayDistance = true,
+			DisplayHealth = true,
+			DisplayName = true
+		},
+
+		TracersSettings = {
+			Enabled = true,
+			TeamCheck = false,
+			Type = 1, -- 1 - Bottom; 2 - Center; 3 - Mouse
+			Transparency = 0.7,
+			Thickness = 1,
+			Color = Color3fromRGB(255, 255, 255)
+		},
+
+		BoxSettings = {
+			Enabled = true,
+			TeamCheck = false,
+			Type = 1, -- 1 - 3D; 2 - 2D
+			Color = Color3fromRGB(255, 255, 255),
+			Transparency = 0.7,
+			Thickness = 1,
+			Filled = false, -- For 2D
+			Increase = 1 -- For 3D
+		},
+
+		HeadDotSettings = {
+			Enabled = true,
+			TeamCheck = false,
+			Color = Color3fromRGB(255, 255, 255),
+			Transparency = 0.5,
+			Thickness = 1,
+			Filled = false,
+			Sides = 30
+		},
+
+		HealthBarSettings = {
+			Enabled = false,
+			TeamCheck = false,
+			Transparency = 0.8,
+			Size = 2,
+			Offset = 10,
+			OutlineColor = Color3fromRGB(0, 0, 0),
+			Blue = 50,
+			Type = 3 -- 1 - Top; 2 - Bottom; 3 - Left; 4 - Right
+		}
+	},
+
+	Crosshair = {
+		Settings = {
+			Enabled = false,
+			Type = 1, -- 1 - Mouse; 2 - Center
+			Size = 12,
+			Thickness = 1,
+			Color = Color3fromRGB(0, 255, 0),
+			Transparency = 1,
+			GapSize = 5,
+			Rotation = 0,
+			CenterDot = false,
+			CenterDotColor = Color3fromRGB(0, 255, 0),
+			CenterDotSize = 1,
+			CenterDotTransparency = 1,
+			CenterDotFilled = true,
+			CenterDotThickness = 1
+		},
+
+		Parts = {
+			LeftLine = Drawingnew("Line"),
+			RightLine = Drawingnew("Line"),
+			TopLine = Drawingnew("Line"),
+			BottomLine = Drawingnew("Line"),
+			CenterDot = Drawingnew("Circle")
+		}
+	},
+
+	WrappedPlayers = {}
+}
+
+local Environment = getgenv().AirHub.WallHack
+
+--// Part resolution -------------------------------------------------------
+-- Games frequently rename or nest body parts. Resolve a usable head/root by
+-- walking descendants, matching case-insensitively, and cache the result per
+-- character so the render loop does not rescan the model every frame.
+
+local partCache = setmetatable({}, { __mode = "k" })
+
+local function ScanPart(Character, Name)
+	local LowerName = string.lower(Name)
+	local LowerMatch
+
+	for _, Descendant in next, Character:GetDescendants() do
+		if Descendant:IsA("BasePart") then
+			if Descendant.Name == Name then
+				return Descendant
+			elseif not LowerMatch and string.lower(Descendant.Name) == LowerName then
+				LowerMatch = Descendant
+			end
+		end
+	end
+
+	return LowerMatch
+end
+
+local function FindPart(Character, Names)
+	if typeof(Character) ~= "Instance" then
+		return nil
+	end
+
+	local Cache = partCache[Character]
+
+	if not Cache then
+		Cache = {}
+		partCache[Character] = Cache
+	end
+
+	local Key = Names[1]
+	local Entry = Cache[Key]
+
+	if Entry ~= nil then
+		if Entry == false then
+			return nil
+		end
+
+		if Entry.Parent then
+			return Entry
+		end
+	end
+
+	local Found
+
+	for _, Name in next, Names do
+		local Direct = Character:FindFirstChild(Name)
+
+		if Direct and Direct:IsA("BasePart") then
+			Found = Direct
+			break
+		end
+
+		Found = ScanPart(Character, Name)
+
+		if Found then
+			break
+		end
+	end
+
+	Cache[Key] = Found or false
+
+	return Found
+end
+
+local function GetRigType(Character)
+	if Character:FindFirstChild("LowerTorso") or Character:FindFirstChild("UpperTorso") then
+		return "R15"
+	elseif Character:FindFirstChild("Torso") then
+		return "R6"
+	end
+
+	return "Custom"
+end
+
+local function GetChamParts(Character, RigType, EntireBody)
+	local Parts, Seen = {}, {}
+
+	local function Add(Part)
+		if Part and not Seen[Part] and Part:IsA("BasePart") then
+			Seen[Part] = true
+			Parts[#Parts + 1] = Part
+		end
+	end
+
+	if RigType == "R6" then
+		for _, Name in next, R6_CHAM_PARTS do
+			Add(FindPart(Character, { Name }))
+		end
+
+		return Parts
+	elseif RigType == "R15" then
+		local List = EntireBody and R15_CHAM_PARTS_FULL or R15_CHAM_PARTS_LIGHT
+
+		for _, Name in next, List do
+			Add(FindPart(Character, { Name }))
+		end
+
+		return Parts
+	end
+
+	-- Custom rig: always include the resolved head and root, then use the
+	-- largest body parts so we cover the silhouette without drawing hundreds
+	-- of tiny accessories.
+	Add(FindPart(Character, HEAD_NAMES))
+	Add(FindPart(Character, ROOT_NAMES))
+
+	local Candidates = {}
+
+	for _, Descendant in next, Character:GetDescendants() do
+		if Descendant:IsA("BasePart") and not Seen[Descendant] and Descendant.Transparency < 1 then
+			Candidates[#Candidates + 1] = Descendant
+		end
+	end
+
+	table.sort(Candidates, function(A, B)
+		local SA, SB = A.Size, B.Size
+		return (SA.X * SA.Y * SA.Z) > (SB.X * SB.Y * SB.Z)
+	end)
+
+	local Limit = EntireBody and 16 or 6
+
+	for _, Part in next, Candidates do
+		if #Parts >= Limit then
+			break
+		end
+
+		Add(Part)
+	end
+
+	return Parts
+end
+
+--// Geometry --------------------------------------------------------------
+
+local CORNER_OFFSETS = {
+	Vector3new(1, 1, 1), Vector3new(-1, 1, 1), Vector3new(1, -1, 1), Vector3new(-1, -1, 1),
+	Vector3new(1, 1, -1), Vector3new(-1, 1, -1), Vector3new(1, -1, -1), Vector3new(-1, -1, -1)
+}
+
+-- Order: front, back, top, bottom, right, left. Each entry maps a quad to
+-- four of the eight projected corners (top-left, bottom-left, bottom-right,
+-- top-right) exactly like the original module.
+local QUAD_MAP = {
+	{ 1, 3, 4, 2 },
+	{ 5, 7, 8, 6 },
+	{ 1, 5, 6, 2 },
+	{ 3, 7, 8, 4 },
+	{ 1, 3, 7, 5 },
+	{ 2, 4, 8, 6 }
+}
+
+local function GetScreenBox(Character)
+	local Success, BoxCFrame, BoxSize = pcall(function()
+		return Character:GetBoundingBox()
+	end)
+
+	if not Success or not BoxCFrame or not BoxSize then
+		local Root = FindPart(Character, ROOT_NAMES)
+
+		if not Root then
+			return nil
+		end
+
+		BoxCFrame, BoxSize = Root.CFrame, Vector3new(4, 5, 4)
+	end
+
+	local Half = BoxSize / 2
+	local MinX, MinY, MaxX, MaxY = mathhuge, mathhuge, -mathhuge, -mathhuge
+	local Points = 0
+
+	for Index = 1, 8 do
+		local Offset = CORNER_OFFSETS[Index]
+		local World = BoxCFrame * Vector3new(Offset.X * Half.X, Offset.Y * Half.Y, Offset.Z * Half.Z)
+		local Vector, OnScreen = Camera:WorldToViewportPoint(World)
+
+		if OnScreen then
+			local X, Y = Vector.X, Vector.Y
+
+			if X < MinX then MinX = X end
+			if X > MaxX then MaxX = X end
+			if Y < MinY then MinY = Y end
+			if Y > MaxY then MaxY = Y end
+
+			Points = Points + 1
+		end
+	end
+
+	if Points == 0 then
+		return nil
+	end
+
+	return {
+		MinX = MinX,
+		MinY = MinY,
+		MaxX = MaxX,
+		MaxY = MaxY,
+		Width = MaxX - MinX,
+		Height = MaxY - MinY,
+		CenterX = (MinX + MaxX) / 2,
+		CenterY = (MinY + MaxY) / 2
+	}
+end
+
+--// Drawing helpers -------------------------------------------------------
+
+local function RemoveDrawing(Object)
+	if Object and Object.Remove then
+		pcall(Object.Remove, Object)
+	end
+end
+
+local function CreateCham()
+	local Cham = {}
+
+	for Index = 1, 6 do
+		Cham[Index] = Drawingnew("Quad")
+	end
+
+	return Cham
+end
+
+local function HideCham(Cham)
+	for Index = 1, 6 do
+		local Quad = Cham[Index]
+
+		if Quad then
+			Quad.Visible = false
+		end
+	end
+end
+
+local function RemoveCham(Cham)
+	for Index = 1, 6 do
+		RemoveDrawing(Cham[Index])
+	end
+end
+
+local function ClearChams(State)
+	for _, Cham in next, State.Chams do
+		RemoveCham(Cham)
+	end
+
+	State.Chams = {}
+end
+
+local function HideState(State)
+	State.ESP.Visible = false
+	State.Tracer.Visible = false
+	State.HeadDot.Visible = false
+	State.HealthBar.Main.Visible = false
+	State.HealthBar.Outline.Visible = false
+
+	State.Box.Square.Visible = false
+	State.Box.Top.Visible = false
+	State.Box.Right.Visible = false
+	State.Box.Bottom.Visible = false
+	State.Box.Left.Visible = false
+
+	for _, Cham in next, State.Chams do
+		HideCham(Cham)
+	end
+end
+
+local function CreateState(Player)
+	return {
+		Player = Player,
+		Character = nil,
+		RigType = nil,
+		Allied = false,
+		Chams = {},
+		ChamsCharacter = nil,
+		ChamsRigType = nil,
+		ChamsEntireBody = nil,
+		ESP = Drawingnew("Text"),
+		Tracer = Drawingnew("Line"),
+		HeadDot = Drawingnew("Circle"),
+		Box = {
+			Square = Drawingnew("Square"),
+			Top = Drawingnew("Line"),
+			Right = Drawingnew("Line"),
+			Bottom = Drawingnew("Line"),
+			Left = Drawingnew("Line")
+		},
+		HealthBar = {
+			Main = Drawingnew("Square"),
+			Outline = Drawingnew("Square")
+		}
+	}
+end
+
+local function RemoveState(State)
+	RemoveDrawing(State.ESP)
+	RemoveDrawing(State.Tracer)
+	RemoveDrawing(State.HeadDot)
+	RemoveDrawing(State.HealthBar.Main)
+	RemoveDrawing(State.HealthBar.Outline)
+	RemoveDrawing(State.Box.Square)
+	RemoveDrawing(State.Box.Top)
+	RemoveDrawing(State.Box.Right)
+	RemoveDrawing(State.Box.Bottom)
+	RemoveDrawing(State.Box.Left)
+
+	ClearChams(State)
+end
+
+--// Update checks ---------------------------------------------------------
+
+local function IsIgnored(Player)
+	local List = Environment.Settings.IgnoredPlayers
+
+	if type(List) ~= "table" then
+		return false
+	end
+
+	for _, Name in next, List do
+		if Name == Player.Name or Name == Player.DisplayName then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function UpdateTeamState(State, Player)
+	local Visuals = Environment.Visuals
+	local AnyTeamCheck = Environment.Settings.TeamCheck
+		or Visuals.ChamsSettings.TeamCheck
+		or Visuals.ESPSettings.TeamCheck
+		or Visuals.TracersSettings.TeamCheck
+		or Visuals.BoxSettings.TeamCheck
+		or Visuals.HeadDotSettings.TeamCheck
+		or Visuals.HealthBarSettings.TeamCheck
+
+	if not AnyTeamCheck then
+		State.Allied = false
+		return
+	end
+
+	local Custom = Environment.Settings.CustomTeamCheck
+
+	if type(Custom) == "function" and LocalPlayer then
+		local Success, Allied = pcall(Custom, Player)
+		State.Allied = (Success and Allied) and true or false
+	elseif LocalPlayer then
+		State.Allied = Player.TeamColor == LocalPlayer.TeamColor
+	else
+		State.Allied = false
+	end
+end
+
+local function TeamOK(State, Feature)
+	if Environment.Settings.TeamCheck or (Feature and Feature.TeamCheck) then
+		return not State.Allied
+	end
+
+	return true
+end
+
+--// Chams -----------------------------------------------------------------
+
+local function UpdateCham(Part, Cham)
+	local CFrame, HalfSize = Part.CFrame, Part.Size / 2
+	local Projected = {}
+	local OnScreen = false
+
+	for Index = 1, 8 do
+		local Offset = CORNER_OFFSETS[Index]
+		local World = CFrame * Vector3new(Offset.X * HalfSize.X, Offset.Y * HalfSize.Y, Offset.Z * HalfSize.Z)
+		local Vector, Visible = Camera:WorldToViewportPoint(World)
+
+		Projected[Index] = Vector2new(Vector.X, Vector.Y)
+
+		if Visible then
+			OnScreen = true
+		end
+	end
+
+	local Settings = Environment.Visuals.ChamsSettings
+
+	for Index = 1, 6 do
+		local Quad = Cham[Index]
+
+		if Quad then
+			Quad.Transparency = Settings.Transparency
+			Quad.Color = Settings.Color
+			Quad.Thickness = Settings.Thickness
+			Quad.Filled = Settings.Filled
+			Quad.Visible = OnScreen
+
+			if OnScreen then
+				local Map = QUAD_MAP[Index]
+				Quad.PointA = Projected[Map[1]]
+				Quad.PointB = Projected[Map[2]]
+				Quad.PointC = Projected[Map[3]]
+				Quad.PointD = Projected[Map[4]]
+			end
+		end
+	end
+end
+
+local function SyncChams(State, Character, RigType)
+	local Settings = Environment.Visuals.ChamsSettings
+
+	if not Settings.Enabled then
+		if State.ChamsCharacter ~= nil then
+			ClearChams(State)
+			State.ChamsCharacter = nil
+			State.ChamsRigType = nil
+			State.ChamsEntireBody = nil
+		end
+
+		return
+	end
+
+	local EntireBody = Settings.EntireBody and true or false
+	local NeedsRebuild = State.ChamsCharacter ~= Character
+		or State.ChamsRigType ~= RigType
+		or State.ChamsEntireBody ~= EntireBody
+
+	if not NeedsRebuild then
+		for Part in next, State.Chams do
+			if not Part.Parent then
+				NeedsRebuild = true
+				break
+			end
+		end
+	end
+
+	if NeedsRebuild then
+		ClearChams(State)
+
+		-- Drawing objects are a limited resource in most executors. If we run
+		-- out mid-build, drop the partial chams instead of erroring every
+		-- frame. The markers below prevent a retry until the rig changes.
+		local Built = pcall(function()
+			for _, Part in next, GetChamParts(Character, RigType, EntireBody) do
+				State.Chams[Part] = CreateCham()
+			end
+		end)
+
+		if not Built then
+			ClearChams(State)
+		end
+
+		State.ChamsCharacter = Character
+		State.ChamsRigType = RigType
+		State.ChamsEntireBody = EntireBody
+	end
+end
+
+--// Visual updates --------------------------------------------------------
+
+local function UpdateESP(State, Player, Humanoid, Screen, HeadPosition, RootPosition, LocalPosition)
+	local Settings = Environment.Visuals.ESPSettings
+	local ESP = State.ESP
+
+	if not (Settings.Enabled and Screen and TeamOK(State, Settings)) then
+		ESP.Visible = false
+		return
+	end
+
+	local Character = Player.Character
+	local Tool = Character and Character:FindFirstChildOfClass("Tool")
+	local Pieces = {}
+
+	if Settings.DisplayName then
+		Pieces[#Pieces + 1] = Player.DisplayName == Player.Name and Player.Name or Player.DisplayName .. " {" .. Player.Name .. "}"
+	end
+
+	if Settings.DisplayHealth and Humanoid then
+		Pieces[#Pieces + 1] = "(" .. tostring(mathfloor(Humanoid.Health)) .. ")"
+	end
+
+	local Content = table.concat(Pieces, " ")
+
+	if Settings.DisplayDistance then
+		local Position = RootPosition or HeadPosition
+		local Distance = 0
+
+		if Position and LocalPosition then
+			Distance = mathfloor((Position - LocalPosition).Magnitude)
+		end
+
+		Content = Content .. (Content ~= "" and " " or "") .. "[" .. tostring(Distance) .. "]"
+	end
+
+	if Tool then
+		Content = "[" .. Tool.Name .. "]\n" .. Content
+	end
+
+	ESP.Center = true
+	ESP.Size = Settings.TextSize
+	ESP.Outline = Settings.Outline
+	ESP.OutlineColor = Settings.OutlineColor
+	ESP.Color = Settings.TextColor
+	ESP.Transparency = Settings.TextTransparency
+	ESP.Font = Settings.TextFont
+	ESP.Text = Content
+	ESP.Position = Vector2new(Screen.CenterX, Screen.MinY - Settings.Offset - (Tool and 10 or 0))
+	ESP.Visible = true
+end
+
+local function UpdateTracer(State, Screen)
+	local Settings = Environment.Visuals.TracersSettings
+	local Tracer = State.Tracer
+
+	if not (Settings.Enabled and Screen and TeamOK(State, Settings)) then
+		Tracer.Visible = false
+		return
+	end
+
+	Tracer.Thickness = Settings.Thickness
+	Tracer.Color = Settings.Color
+	Tracer.Transparency = Settings.Transparency
+	Tracer.To = Vector2new(Screen.CenterX, Settings.Type == 2 and Screen.CenterY or Screen.MaxY)
+
+	local Viewport = Camera.ViewportSize
+
+	if Settings.Type == 2 then
+		Tracer.From = Vector2new(Viewport.X / 2, Viewport.Y / 2)
+	elseif Settings.Type == 3 then
+		local Mouse = UserInputService:GetMouseLocation()
+		Tracer.From = Vector2new(Mouse.X, Mouse.Y)
+	else
+		Tracer.From = Vector2new(Viewport.X / 2, Viewport.Y)
+	end
+
+	Tracer.Visible = true
+end
+
+local function UpdateBox(State, Screen)
+	local Settings = Environment.Visuals.BoxSettings
+	local Box = State.Box
+	local UseLines = Settings.Type == 1
+
+	if not (Settings.Enabled and Screen and TeamOK(State, Settings)) then
+		Box.Square.Visible = false
+		Box.Top.Visible = false
+		Box.Right.Visible = false
+		Box.Bottom.Visible = false
+		Box.Left.Visible = false
+		return
+	end
+
+	local Increase = Settings.Increase or 1
+	local Width = Screen.Width * Increase
+	local Height = Screen.Height * Increase
+	local X = Screen.CenterX - Width / 2
+	local Y = Screen.CenterY - Height / 2
+	local Right = X + Width
+	local Bottom = Y + Height
+
+	if UseLines then
+		Box.Square.Visible = false
+
+		for _, Line in next, { Box.Top, Box.Right, Box.Bottom, Box.Left } do
+			Line.Thickness = Settings.Thickness
+			Line.Transparency = Settings.Transparency
+			Line.Color = Settings.Color
+			Line.Visible = true
+		end
+
+		Box.Top.From = Vector2new(X, Y)
+		Box.Top.To = Vector2new(Right, Y)
+
+		Box.Right.From = Vector2new(Right, Y)
+		Box.Right.To = Vector2new(Right, Bottom)
+
+		Box.Bottom.From = Vector2new(Right, Bottom)
+		Box.Bottom.To = Vector2new(X, Bottom)
+
+		Box.Left.From = Vector2new(X, Bottom)
+		Box.Left.To = Vector2new(X, Y)
+	else
+		Box.Top.Visible = false
+		Box.Right.Visible = false
+		Box.Bottom.Visible = false
+		Box.Left.Visible = false
+
+		Box.Square.Thickness = Settings.Thickness
+		Box.Square.Color = Settings.Color
+		Box.Square.Transparency = Settings.Transparency
+		Box.Square.Filled = Settings.Filled
+		Box.Square.Size = Vector2new(Width, Height)
+		Box.Square.Position = Vector2new(X, Y)
+		Box.Square.Visible = true
+	end
+end
+
+local function UpdateHeadDot(State, Head, Screen)
+	local Settings = Environment.Visuals.HeadDotSettings
+	local Dot = State.HeadDot
+
+	if not (Settings.Enabled and TeamOK(State, Settings)) then
+		Dot.Visible = false
+		return
+	end
+
+	local Position, Radius
+
+	if Head then
+		local Vector, OnScreen = Camera:WorldToViewportPoint(Head.Position)
+
+		if not OnScreen then
+			Dot.Visible = false
+			return
+		end
+
+		local Top = Camera:WorldToViewportPoint(Head.Position + Vector3new(0, Head.Size.Y / 2, 0))
+		local Bottom = Camera:WorldToViewportPoint(Head.Position - Vector3new(0, Head.Size.Y / 2, 0))
+
+		Position = Vector2new(Vector.X, Vector.Y)
+		Radius = mathmax(mathabs(Top.Y - Bottom.Y) / 2, 1)
+	elseif Screen then
+		Position = Vector2new(Screen.CenterX, Screen.MinY)
+		Radius = mathmax(mathmin(Screen.Width / 8, Screen.Height / 8), 2)
+	else
+		Dot.Visible = false
+		return
+	end
+
+	Dot.Thickness = Settings.Thickness
+	Dot.Color = Settings.Color
+	Dot.Transparency = Settings.Transparency
+	Dot.NumSides = Settings.Sides
+	Dot.Filled = Settings.Filled
+	Dot.Position = Position
+	Dot.Radius = Radius
+	Dot.Visible = true
+end
+
+local function UpdateHealthBar(State, Humanoid, Screen)
+	local Settings = Environment.Visuals.HealthBarSettings
+	local Main, Outline = State.HealthBar.Main, State.HealthBar.Outline
+
+	if not (Settings.Enabled and Humanoid and Screen and TeamOK(State, Settings)) then
+		Main.Visible = false
+		Outline.Visible = false
+		return
+	end
+
+	local MaxHealth = Humanoid.MaxHealth
+
+	if MaxHealth <= 0 then
+		MaxHealth = 100
+	end
+
+	local Ratio = mathmin(mathmax(Humanoid.Health / MaxHealth, 0), 1)
+	local Width = mathmax(Screen.Width, 10)
+	local Height = mathmax(Screen.Height, 10)
+	local Size = Settings.Size
+	local Offset = Settings.Offset
+	local OutlineX, OutlineY, OutlineWidth, OutlineHeight
+	local MainX, MainY, MainWidth, MainHeight
+
+	if Settings.Type == 1 or Settings.Type == 2 then
+		OutlineWidth, OutlineHeight = Width, Size
+		OutlineX = Screen.MinX
+		OutlineY = Settings.Type == 1 and (Screen.MinY - Size - Offset) or (Screen.MaxY + Offset)
+
+		MainWidth, MainHeight = Width * Ratio, Size
+		MainX, MainY = OutlineX, OutlineY
+	else
+		OutlineWidth, OutlineHeight = Size, Height
+		OutlineX = Settings.Type == 3 and (Screen.MinX - Size - Offset) or (Screen.MaxX + Offset)
+		OutlineY = Screen.MinY
+
+		MainWidth, MainHeight = Size, Height * Ratio
+		MainX = OutlineX
+		MainY = OutlineY + (Height - MainHeight)
+	end
+
+	Outline.Thickness = 3
+	Outline.Color = Settings.OutlineColor
+	Outline.Transparency = Settings.Transparency
+	Outline.Filled = false
+	Outline.Size = Vector2new(OutlineWidth, OutlineHeight)
+	Outline.Position = Vector2new(OutlineX, OutlineY)
+	Outline.ZIndex = 1
+	Outline.Visible = true
+
+	Main.Thickness = 1
+	Main.Color = Color3fromRGB(
+		mathfloor((1 - Ratio) * 255),
+		mathfloor(Ratio * 255),
+		Settings.Blue
+	)
+	Main.Transparency = Settings.Transparency
+	Main.Filled = true
+	Main.Size = Vector2new(MainWidth, MainHeight)
+	Main.Position = Vector2new(MainX, MainY)
+	Main.ZIndex = 2
+	Main.Visible = true
+end
+
+local function UpdateChams(State, Screen)
+	if not Screen then
+		return
+	end
+
+	local Settings = Environment.Visuals.ChamsSettings
+	local Visible = Settings.Enabled and TeamOK(State, Settings)
+
+	for Part, Cham in next, State.Chams do
+		if Visible and Part.Parent then
+			UpdateCham(Part, Cham)
+		else
+			HideCham(Cham)
+		end
+	end
+end
+
+--// Player updates --------------------------------------------------------
+
+local function UpdatePlayer(Player, State, LocalPosition)
+	local Settings = Environment.Settings
+
+	if not Settings.Enabled then
+		HideState(State)
+		return
+	end
+
+	local Character = Player.Character
+
+	if not Character or not Character.Parent then
+		HideState(State)
+		return
+	end
+
+	local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+	local Alive = (not Settings.AliveCheck) or Humanoid == nil or Humanoid.Health > 0
+
+	if not Alive or IsIgnored(Player) then
+		HideState(State)
+		return
+	end
+
+	local Head = FindPart(Character, HEAD_NAMES)
+	local Root = FindPart(Character, ROOT_NAMES)
+
+	if not Head and not Root then
+		HideState(State)
+		return
+	end
+
+	UpdateTeamState(State, Player)
+
+	local Screen = GetScreenBox(Character)
+	local HeadPosition = Head and Head.Position or nil
+	local RootPosition = Root and Root.Position or nil
+
+	if not Screen then
+		HideState(State)
+		return
+	end
+
+	UpdateESP(State, Player, Humanoid, Screen, HeadPosition, RootPosition, LocalPosition)
+	UpdateTracer(State, Screen)
+	UpdateBox(State, Screen)
+	UpdateHeadDot(State, Head, Screen)
+	UpdateHealthBar(State, Humanoid, Screen)
+
+	SyncChams(State, Character, GetRigType(Character))
+	UpdateChams(State, Screen)
+end
+
+local function GetState(Player)
+	local State = Environment.WrappedPlayers[Player]
+
+	if not State then
+		State = CreateState(Player)
+		Environment.WrappedPlayers[Player] = State
+	end
+
+	return State
+end
+
+local function Unwrap(Player)
+	local State = Environment.WrappedPlayers[Player]
+
+	if not State then
+		return
+	end
+
+	RemoveState(State)
+	Environment.WrappedPlayers[Player] = nil
+end
+
+--// Crosshair -------------------------------------------------------------
+
+local function AddCrosshair()
+	ServiceConnections.CrosshairConnection = RunService.RenderStepped:Connect(function()
+		local Settings = Environment.Crosshair.Settings
+		local Parts = Environment.Crosshair.Parts
+
+		if not Settings.Enabled then
+			Parts.LeftLine.Visible = false
+			Parts.RightLine.Visible = false
+			Parts.TopLine.Visible = false
+			Parts.BottomLine.Visible = false
+			Parts.CenterDot.Visible = false
+			return
+		end
+
+		local AxisX, AxisY
+
+		if Settings.Type == 2 then
+			AxisX, AxisY = Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2
+		else
+			local Mouse = UserInputService:GetMouseLocation()
+			AxisX, AxisY = Mouse.X, Mouse.Y
+		end
+
+		local Rotation = mathrad(Settings.Rotation or 0)
+		local Cos, Sin = mathcos(Rotation), mathsin(Rotation)
+		local Gap, Size = Settings.GapSize, Settings.Size
+
+		Parts.LeftLine.Visible = true
+		Parts.LeftLine.Color = Settings.Color
+		Parts.LeftLine.Thickness = Settings.Thickness
+		Parts.LeftLine.Transparency = Settings.Transparency
+		Parts.LeftLine.From = Vector2new(AxisX - Cos * Gap, AxisY - Sin * Gap)
+		Parts.LeftLine.To = Vector2new(AxisX - Cos * (Size + Gap), AxisY - Sin * (Size + Gap))
+
+		Parts.RightLine.Visible = true
+		Parts.RightLine.Color = Settings.Color
+		Parts.RightLine.Thickness = Settings.Thickness
+		Parts.RightLine.Transparency = Settings.Transparency
+		Parts.RightLine.From = Vector2new(AxisX + Cos * Gap, AxisY + Sin * Gap)
+		Parts.RightLine.To = Vector2new(AxisX + Cos * (Size + Gap), AxisY + Sin * (Size + Gap))
+
+		Parts.TopLine.Visible = true
+		Parts.TopLine.Color = Settings.Color
+		Parts.TopLine.Thickness = Settings.Thickness
+		Parts.TopLine.Transparency = Settings.Transparency
+		Parts.TopLine.From = Vector2new(AxisX - Sin * Gap, AxisY - Cos * Gap)
+		Parts.TopLine.To = Vector2new(AxisX - Sin * (Size + Gap), AxisY - Cos * (Size + Gap))
+
+		Parts.BottomLine.Visible = true
+		Parts.BottomLine.Color = Settings.Color
+		Parts.BottomLine.Thickness = Settings.Thickness
+		Parts.BottomLine.Transparency = Settings.Transparency
+		Parts.BottomLine.From = Vector2new(AxisX + Sin * Gap, AxisY + Cos * Gap)
+		Parts.BottomLine.To = Vector2new(AxisX + Sin * (Size + Gap), AxisY + Cos * (Size + Gap))
+
+		local CenterDot = Parts.CenterDot
+		CenterDot.Visible = Settings.CenterDot and true or false
+		CenterDot.Color = Settings.CenterDotColor
+		CenterDot.Radius = Settings.CenterDotSize
+		CenterDot.Transparency = Settings.CenterDotTransparency
+		CenterDot.Filled = Settings.CenterDotFilled
+		CenterDot.Thickness = Settings.CenterDotThickness
+		CenterDot.Position = Vector2new(AxisX, AxisY)
+	end)
+end
+
+--// Main loop -------------------------------------------------------------
+
+local function UpdateAll()
+	Camera = workspace.CurrentCamera or Camera
+
+	if not Camera then
+		return
+	end
+
+	local LocalCharacter = LocalPlayer and LocalPlayer.Character
+	local LocalRoot = LocalCharacter and FindPart(LocalCharacter, ROOT_NAMES)
+	local LocalPosition = LocalRoot and LocalRoot.Position or Camera.CFrame.Position
+
+	for Player, State in next, Environment.WrappedPlayers do
+		if Player.Parent then
+			UpdatePlayer(Player, State, LocalPosition)
+		else
+			Unwrap(Player)
+		end
+	end
+end
+
+local function Load()
+	AddCrosshair()
+
+	for _, Player in next, Players:GetPlayers() do
+		if Player ~= LocalPlayer then
+			GetState(Player)
+		end
+	end
+
+	ServiceConnections.PlayerAddedConnection = Players.PlayerAdded:Connect(function(Player)
+		if Player ~= LocalPlayer then
+			GetState(Player)
+		end
+	end)
+
+	ServiceConnections.PlayerRemovingConnection = Players.PlayerRemoving:Connect(Unwrap)
+	ServiceConnections.UpdateConnection = RunService.RenderStepped:Connect(UpdateAll)
+end
+
+--// Defaults --------------------------------------------------------------
+
+local DEFAULT_SETTINGS = {
+	Enabled = false,
+	TeamCheck = false,
+	AliveCheck = true
+}
+
+local DEFAULT_CHAMS = {
+	Enabled = false,
+	TeamCheck = false,
+	Color = Color3fromRGB(255, 255, 255),
+	Transparency = 0.2,
+	Thickness = 0,
+	Filled = true,
+	EntireBody = false
+}
+
+local DEFAULT_ESP = {
+	Enabled = true,
+	TeamCheck = false,
+	TextColor = Color3fromRGB(255, 255, 255),
+	TextSize = 14,
+	Center = true,
+	Outline = true,
+	OutlineColor = Color3fromRGB(0, 0, 0),
+	TextTransparency = 0.7,
+	TextFont = Drawing.Fonts.UI,
+	Offset = 20,
+	DisplayDistance = true,
+	DisplayHealth = true,
+	DisplayName = true
+}
+
+local DEFAULT_TRACERS = {
+	Enabled = true,
+	TeamCheck = false,
+	Type = 1,
+	Transparency = 0.7,
+	Thickness = 1,
+	Color = Color3fromRGB(255, 255, 255)
+}
+
+local DEFAULT_BOXES = {
+	Enabled = true,
+	TeamCheck = false,
+	Type = 1,
+	Color = Color3fromRGB(255, 255, 255),
+	Transparency = 0.7,
+	Thickness = 1,
+	Filled = false,
+	Increase = 1
+}
+
+local DEFAULT_HEADDOTS = {
+	Enabled = true,
+	TeamCheck = false,
+	Color = Color3fromRGB(255, 255, 255),
+	Transparency = 0.5,
+	Thickness = 1,
+	Filled = false,
+	Sides = 30
+}
+
+local DEFAULT_HEALTHBAR = {
+	Enabled = false,
+	TeamCheck = false,
+	Transparency = 0.8,
+	Size = 2,
+	Offset = 10,
+	OutlineColor = Color3fromRGB(0, 0, 0),
+	Blue = 50,
+	Type = 3
+}
+
+local DEFAULT_CROSSHAIR = {
+	Enabled = false,
+	Type = 1,
+	Size = 12,
+	Thickness = 1,
+	Color = Color3fromRGB(0, 255, 0),
+	Transparency = 1,
+	GapSize = 5,
+	Rotation = 0,
+	CenterDot = false,
+	CenterDotColor = Color3fromRGB(0, 255, 0),
+	CenterDotSize = 1,
+	CenterDotTransparency = 1,
+	CenterDotFilled = true,
+	CenterDotThickness = 1
+}
+
+local function ApplyDefaults(Target, Defaults)
+	for Key in next, Target do
+		Target[Key] = nil
+	end
+
+	for Key, Value in next, Defaults do
+		Target[Key] = Value
+	end
+end
+
+--// Functions -------------------------------------------------------------
+
+Environment.Functions = {}
+
+function Environment.Functions:Exit()
+	for _, Connection in next, ServiceConnections do
+		Connection:Disconnect()
+	end
+
+	ServiceConnections = {}
+
+	for _, State in next, Environment.WrappedPlayers do
+		RemoveState(State)
+	end
+
+	Environment.WrappedPlayers = {}
+
+	for _, Part in next, Environment.Crosshair.Parts do
+		RemoveDrawing(Part)
+	end
+
+	local Hub = getgenv().AirHub
+
+	if Hub then
+		Hub.WallHack = nil
+	end
+end
+
+function Environment.Functions:Restart()
+	for _, Connection in next, ServiceConnections do
+		Connection:Disconnect()
+	end
+
+	ServiceConnections = {}
+
+	for _, State in next, Environment.WrappedPlayers do
+		RemoveState(State)
+	end
+
+	Environment.WrappedPlayers = {}
+
+	Load()
+end
+
+function Environment.Functions:ResetSettings()
+	-- Mutate the existing tables in place: the hub stores references to these
+	-- tables, so replacing them would silently disconnect the whole UI.
+	local CustomTeamCheck = Environment.Settings.CustomTeamCheck
+
+	ApplyDefaults(Environment.Settings, DEFAULT_SETTINGS)
+	ApplyDefaults(Environment.Visuals.ChamsSettings, DEFAULT_CHAMS)
+	ApplyDefaults(Environment.Visuals.ESPSettings, DEFAULT_ESP)
+	ApplyDefaults(Environment.Visuals.TracersSettings, DEFAULT_TRACERS)
+	ApplyDefaults(Environment.Visuals.BoxSettings, DEFAULT_BOXES)
+	ApplyDefaults(Environment.Visuals.HeadDotSettings, DEFAULT_HEADDOTS)
+	ApplyDefaults(Environment.Visuals.HealthBarSettings, DEFAULT_HEALTHBAR)
+	ApplyDefaults(Environment.Crosshair.Settings, DEFAULT_CROSSHAIR)
+
+	Environment.Settings.CustomTeamCheck = CustomTeamCheck
+
+	if type(Environment.Settings.IgnoredPlayers) ~= "table" then
+		Environment.Settings.IgnoredPlayers = {}
+	else
+		table.clear(Environment.Settings.IgnoredPlayers)
+	end
+end
+
+setmetatable(Environment.Functions, {
+	__newindex = warn
+})
+
+--// Main
+
+Load()
