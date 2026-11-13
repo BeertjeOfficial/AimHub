@@ -335,6 +335,12 @@ local function GetClosestPlayer()
 		end
 
 		local Position = Part.Position
+		local isPrison = (game.PlaceId == 286090429 or game.GameId == 286090429)
+		if isPrison and (Position.Magnitude > 20000 or (Position - CurrentCamera.CFrame.Position).Magnitude > 20000) then
+			CancelLock()
+			return
+		end
+
 		local Screen, OnScreen = CurrentCamera:WorldToViewportPoint(Position)
 
 		if not OnScreen then
@@ -369,15 +375,18 @@ local function GetClosestPlayer()
 
 					if Part then
 						local Position = Part.Position
-						local Screen, OnScreen = CurrentCamera:WorldToViewportPoint(Position)
+						local isPrison = (game.PlaceId == 286090429 or game.GameId == 286090429)
+						if not (isPrison and (Position.Magnitude > 20000 or (Position - CurrentCamera.CFrame.Position).Magnitude > 20000)) then
+							local Screen, OnScreen = CurrentCamera:WorldToViewportPoint(Position)
 
-						if OnScreen then
-							local Distance = (Mouse - ConvertVector(Screen)).Magnitude
+							if OnScreen then
+								local Distance = (Mouse - ConvertVector(Screen)).Magnitude
 
-							if Distance < RequiredDistance then
-								if not Environment.Settings.WallCheck or IsVisible(Character, Position, CurrentCamera.CFrame.Position) then
-									RequiredDistance = Distance
-									Environment.Locked = Player
+								if Distance < RequiredDistance then
+									if not Environment.Settings.WallCheck or IsVisible(Character, Position, CurrentCamera.CFrame.Position) then
+										RequiredDistance = Distance
+										Environment.Locked = Player
+									end
 								end
 							end
 						end
