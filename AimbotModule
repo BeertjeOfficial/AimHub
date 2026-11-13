@@ -1,1 +1,619 @@
+--[[
 
+	Aimbot Module [AirHub] by Exunys © CC0 1.0 Universal (2023)
+
+	https://github.com/Exunys
+
+	Improved by BeertjeOfficial:
+	- Custom rig / custom part name support (recursive, case-insensitive, attachments)
+	- Native, cached workspace:Raycast visibility checks
+	- IgnoredPlayers / CustomTeamCheck support (used by the hub)
+	- Fewer per-frame allocations and lookups
+
+]]
+
+--// Cache
+
+local pcall, getgenv, next, setmetatable, Vector2new, CFramenew, Color3fromRGB, Drawingnew, stringupper, mousemoverel = pcall, getgenv, next, setmetatable, Vector2.new, CFrame.new, Color3.fromRGB, Drawing.new, string.upper, mousemoverel or (Input and Input.MouseMove)
+
+--// Launching checks
+
+if not getgenv().AirHub or getgenv().AirHub.Aimbot then return end
+
+--// Services
+
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+--// Variables
+
+local RequiredDistance, Typing, Running, ServiceConnections, OriginalSensitivity, SensitivityApplied = 2000, false, false, {}, nil, false
+
+--// Environment
+
+getgenv().AirHub.Aimbot = {
+	Settings = {
+		Enabled = false,
+		TeamCheck = false,
+		AliveCheck = true,
+		WallCheck = false,
+		Sensitivity = 0, -- Animation length (in seconds) before fully locking onto target
+		ThirdPerson = false, -- Uses mousemoverel instead of CFrame to support locking in third person (could be choppy)
+		ThirdPersonSensitivity = 3,
+		TriggerKey = "MouseButton2",
+		Toggle = false,
+		LockPart = "Head", -- Body part to lock on ("Auto" picks the best available part)
+		IgnoredPlayers = {},
+		CustomTeamCheck = nil
+	},
+
+	FOVSettings = {
+		Enabled = true,
+		Visible = true,
+		Amount = 90,
+		Color = Color3fromRGB(255, 255, 255),
+		LockedColor = Color3fromRGB(255, 70, 70),
+		Transparency = 0.5,
+		Sides = 60,
+		Thickness = 1,
+		Filled = false
+	},
+
+	FOVCircle = Drawingnew("Circle")
+}
+
+local Environment = getgenv().AirHub.Aimbot
+
+--// Custom rig support
+
+local FALLBACK_PARTS = {
+	"Head", "UpperTorso", "Torso", "Chest", "HumanoidRootPart",
+	"LowerTorso", "Hitbox", "Body", "Root"
+}
+
+local partCache = setmetatable({}, { __mode = "k" })
+
+local function AimPoint(Instance)
+	if Instance:IsA("Attachment") then
+		local Parent = Instance.Parent
+		if Parent and Parent:IsA("BasePart") then
+			return Parent
+		end
+		return { Position = Instance.WorldPosition }
+	end
+	return Instance
+end
+
+local function ScanForPart(Character, Name)
+	local LowerName = string.lower(Name)
+	local LowerMatch
+
+	for _, Descendant in next, Character:GetDescendants() do
+		if Descendant:IsA("BasePart") or Descendant:IsA("Attachment") then
+			if Descendant.Name == Name then
+				return Descendant
+			elseif not LowerMatch and string.lower(Descendant.Name) == LowerName then
+				LowerMatch = Descendant
+			end
+		end
+	end
+
+	return LowerMatch
+end
+
+local function ResolvePart(Character, Wanted)
+	if typeof(Character) ~= "Instance" then
+		return nil
+	end
+
+	local Key = tostring(Wanted or "Auto")
+	local Cache = partCache[Character]
+
+	if Cache and Cache.Key == Key and Cache.Part and Cache.Part.Parent then
+		return AimPoint(Cache.Part)
+	end
+
+	local Found
+
+	if Key ~= "" and Key ~= "Auto" then
+		local Direct = Character:FindFirstChild(Key)
+
+		if Direct and (Direct:IsA("BasePart") or Direct:IsA("Attachment")) then
+			Found = Direct
+		else
+			Found = ScanForPart(Character, Key)
+		end
+	end
+
+	if not Found then
+		for _, Name in next, FALLBACK_PARTS do
+			Found = ScanForPart(Character, Name)
+			if Found then
+				break
+			end
+		end
+	end
+
+	if not Found and Character:IsA("Model") and Character.PrimaryPart and Character.PrimaryPart:IsA("BasePart") then
+		Found = Character.PrimaryPart
+	end
+
+	if not Found then
+		for _, Descendant in next, Character:GetDescendants() do
+			if Descendant:IsA("BasePart") then
+				Found = Descendant
+				break
+			end
+		end
+	end
+
+	if not Found then
+		return nil
+	end
+
+	partCache[Character] = { Key = Key, Part = Found }
+
+	return AimPoint(Found)
+end
+
+local function ResolveHumanoid(Character)
+	if typeof(Character) ~= "Instance" then
+		return nil
+	end
+
+	return Character:FindFirstChildOfClass("Humanoid")
+end
+
+--// Native visibility
+
+local visibilityCache = setmetatable({}, { __mode = "k" })
+
+local SupportsRespectCanCollide = pcall(function()
+	local Probe = RaycastParams.new()
+	Probe.RespectCanCollide = true
+end)
+
+local function GetVisibilityParams(Character)
+	local Params = visibilityCache[Character]
+	local LocalCharacter = LocalPlayer and LocalPlayer.Character
+
+	-- Rebuild when the local character respawns: the cached filter would
+	-- otherwise miss the new local rig and the ray could hit ourselves.
+	if Params and Params._LocalCharacter == LocalCharacter then
+		return Params
+	end
+
+	Params = RaycastParams.new()
+	Params.FilterType = Enum.RaycastFilterType.Exclude
+	Params.IgnoreWater = true
+
+	if SupportsRespectCanCollide then
+		Params.RespectCanCollide = true
+	end
+
+	local Filter = { Character }
+
+	if LocalCharacter and LocalCharacter ~= Character then
+		Filter[#Filter + 1] = LocalCharacter
+	end
+
+	Params._LocalCharacter = LocalCharacter
+	Params.FilterDescendantsInstances = Filter
+	visibilityCache[Character] = Params
+
+	return Params
+end
+
+local function IsVisible(Character, Position, Origin)
+	if typeof(Character) ~= "Instance" or not Position then
+		return false
+	end
+
+	local CurrentCamera = Camera or workspace.CurrentCamera
+
+	if not Origin then
+		if not CurrentCamera then
+			return false
+		end
+
+		Origin = CurrentCamera.CFrame.Position
+	end
+
+	local Result = workspace:Raycast(Origin, Position - Origin, GetVisibilityParams(Character))
+
+	if not Result then
+		return true
+	end
+
+	local Hit = Result.Instance
+
+	if Hit.Transparency >= 1 then
+		return true
+	end
+
+	if not SupportsRespectCanCollide and not Hit.CanCollide and not Hit:IsA("Terrain") then
+		return true
+	end
+
+	return false
+end
+
+Environment.ResolvePart = ResolvePart
+Environment.ResolveHumanoid = ResolveHumanoid
+Environment.IsVisible = IsVisible
+
+--// Core Functions
+
+local function IsIgnored(Player)
+	local List = Environment.Settings.IgnoredPlayers
+
+	if type(List) ~= "table" then
+		return false
+	end
+
+	for _, Name in next, List do
+		if Name == Player.Name or Name == Player.DisplayName then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function PassesTeamCheck(Player)
+	if not Environment.Settings.TeamCheck then
+		return true
+	end
+
+	local Custom = Environment.Settings.CustomTeamCheck
+
+	if type(Custom) == "function" then
+		local Success, Skip = pcall(Custom, Player)
+		return not (Success and Skip)
+	end
+
+	return Player.TeamColor ~= LocalPlayer.TeamColor
+end
+
+local function ConvertVector(Vector)
+	return Vector2new(Vector.X, Vector.Y)
+end
+
+local function ApplySensitivity(Value)
+	if not SensitivityApplied then
+		OriginalSensitivity = UserInputService.MouseDeltaSensitivity
+		SensitivityApplied = true
+	end
+
+	UserInputService.MouseDeltaSensitivity = Value
+end
+
+local function CancelLock()
+	Environment.Locked = nil
+
+	if Environment.FOVCircle then
+		Environment.FOVCircle.Color = Environment.FOVSettings.Color
+	end
+
+	if SensitivityApplied then
+		UserInputService.MouseDeltaSensitivity = OriginalSensitivity
+		SensitivityApplied = false
+	end
+end
+
+local function GetClosestPlayer()
+	local CurrentCamera = Camera or workspace.CurrentCamera
+
+	if not CurrentCamera then
+		return
+	end
+
+	local Mouse = UserInputService:GetMouseLocation()
+	local Locked = Environment.Locked
+
+	if Locked then
+		local Character = Locked.Character
+		local Humanoid = Character and ResolveHumanoid(Character)
+
+		if not Character or not Character.Parent then
+			CancelLock()
+			return
+		end
+
+		-- A target that was valid when locked can become invalid (team switch,
+		-- added to IgnoredPlayers, toggling team check). Drop the lock instead
+		-- of continuing to aim at it.
+		if not PassesTeamCheck(Locked) or IsIgnored(Locked) then
+			CancelLock()
+			return
+		end
+
+		if Environment.Settings.AliveCheck and Humanoid and Humanoid.Health <= 0 then
+			CancelLock()
+			return
+		end
+
+		local Part = ResolvePart(Character, Environment.Settings.LockPart)
+
+		if not Part then
+			CancelLock()
+			return
+		end
+
+		local Position = Part.Position
+		local Screen, OnScreen = CurrentCamera:WorldToViewportPoint(Position)
+
+		if not OnScreen then
+			CancelLock()
+			return
+		end
+
+		if (Mouse - ConvertVector(Screen)).Magnitude > RequiredDistance then
+			CancelLock()
+			return
+		end
+
+		if Environment.Settings.WallCheck and not IsVisible(Character, Position, CurrentCamera.CFrame.Position) then
+			CancelLock()
+		end
+
+		return
+	end
+
+	RequiredDistance = (Environment.FOVSettings.Enabled and Environment.FOVSettings.Amount or 2000)
+
+	for _, Player in next, Players:GetPlayers() do
+		if Player ~= LocalPlayer and not IsIgnored(Player) and PassesTeamCheck(Player) then
+			local Character = Player.Character
+
+			if Character and Character.Parent then
+				local Humanoid = ResolveHumanoid(Character)
+				local Alive = (not Environment.Settings.AliveCheck) or Humanoid == nil or Humanoid.Health > 0
+
+				if Alive then
+					local Part = ResolvePart(Character, Environment.Settings.LockPart)
+
+					if Part then
+						local Position = Part.Position
+						local Screen, OnScreen = CurrentCamera:WorldToViewportPoint(Position)
+
+						if OnScreen then
+							local Distance = (Mouse - ConvertVector(Screen)).Magnitude
+
+							if Distance < RequiredDistance then
+								if not Environment.Settings.WallCheck or IsVisible(Character, Position, CurrentCamera.CFrame.Position) then
+									RequiredDistance = Distance
+									Environment.Locked = Player
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function UpdateFOVCircle()
+	local FOV = Environment.FOVSettings
+	local Circle = Environment.FOVCircle
+
+	if not Circle then
+		return
+	end
+
+	if FOV.Enabled and Environment.Settings.Enabled then
+		local Mouse = UserInputService:GetMouseLocation()
+
+		Circle.Radius = FOV.Amount
+		Circle.Thickness = FOV.Thickness
+		Circle.Filled = FOV.Filled
+		Circle.NumSides = FOV.Sides
+		Circle.Color = FOV.Color
+		Circle.Transparency = FOV.Transparency
+		Circle.Visible = FOV.Visible
+		Circle.Position = Vector2new(Mouse.X, Mouse.Y)
+	else
+		Circle.Visible = false
+	end
+end
+
+local function Load()
+	if not SensitivityApplied then
+		OriginalSensitivity = UserInputService.MouseDeltaSensitivity
+	end
+
+	ServiceConnections.RenderSteppedConnection = RunService.RenderStepped:Connect(function(Delta)
+		Camera = workspace.CurrentCamera or Camera
+
+		UpdateFOVCircle()
+
+		if not Environment.Settings.Enabled then
+			if Environment.Locked or SensitivityApplied then
+				CancelLock()
+			end
+			return
+		end
+
+		if Running then
+			GetClosestPlayer()
+
+			local Locked = Environment.Locked
+
+			if Locked then
+				local Character = Locked.Character
+				local Part = Character and ResolvePart(Character, Environment.Settings.LockPart)
+
+				if Part then
+					local Position = Part.Position
+
+					if Environment.Settings.ThirdPerson then
+						local Vector = Camera:WorldToViewportPoint(Position)
+						local Mouse = UserInputService:GetMouseLocation()
+
+						mousemoverel((Vector.X - Mouse.X) * Environment.Settings.ThirdPersonSensitivity, (Vector.Y - Mouse.Y) * Environment.Settings.ThirdPersonSensitivity)
+					else
+						local Goal = CFramenew(Camera.CFrame.Position, Position)
+						local Sensitivity = Environment.Settings.Sensitivity
+
+						if Sensitivity > 0 then
+							Camera.CFrame = Camera.CFrame:Lerp(Goal, math.clamp(Delta / Sensitivity, 0, 1))
+						else
+							Camera.CFrame = Goal
+						end
+
+						ApplySensitivity(0)
+					end
+
+					Environment.FOVCircle.Color = Environment.FOVSettings.LockedColor
+				end
+			end
+		end
+	end)
+
+	ServiceConnections.InputBeganConnection = UserInputService.InputBegan:Connect(function(Input)
+		if Typing then
+			return
+		end
+
+		pcall(function()
+			if Input.UserInputType == Enum.UserInputType.Keyboard and Input.KeyCode == Enum.KeyCode[#Environment.Settings.TriggerKey == 1 and stringupper(Environment.Settings.TriggerKey) or Environment.Settings.TriggerKey] or Input.UserInputType == Enum.UserInputType[Environment.Settings.TriggerKey] then
+				if Environment.Settings.Toggle then
+					Running = not Running
+
+					if not Running then
+						CancelLock()
+					end
+				else
+					Running = true
+				end
+			end
+		end)
+	end)
+
+	ServiceConnections.InputEndedConnection = UserInputService.InputEnded:Connect(function(Input)
+		if Typing or Environment.Settings.Toggle then
+			return
+		end
+
+		pcall(function()
+			if Input.UserInputType == Enum.UserInputType.Keyboard and Input.KeyCode == Enum.KeyCode[#Environment.Settings.TriggerKey == 1 and stringupper(Environment.Settings.TriggerKey) or Environment.Settings.TriggerKey] or Input.UserInputType == Enum.UserInputType[Environment.Settings.TriggerKey] then
+				Running = false
+				CancelLock()
+			end
+		end)
+	end)
+
+	ServiceConnections.TypingStartedConnection = UserInputService.TextBoxFocused:Connect(function()
+		Typing = true
+	end)
+
+	ServiceConnections.TypingEndedConnection = UserInputService.TextBoxFocusReleased:Connect(function()
+		Typing = false
+	end)
+end
+
+--// Functions
+
+local DefaultSettings = {
+	Enabled = false,
+	TeamCheck = false,
+	AliveCheck = true,
+	WallCheck = false,
+	Sensitivity = 0,
+	ThirdPerson = false,
+	ThirdPersonSensitivity = 3,
+	TriggerKey = "MouseButton2",
+	Toggle = false,
+	LockPart = "Head",
+	IgnoredPlayers = {},
+	CustomTeamCheck = nil
+}
+
+local DefaultFOVSettings = {
+	Enabled = true,
+	Visible = true,
+	Amount = 90,
+	Color = Color3fromRGB(255, 255, 255),
+	LockedColor = Color3fromRGB(255, 70, 70),
+	Transparency = 0.5,
+	Sides = 60,
+	Thickness = 1,
+	Filled = false
+}
+
+local function ApplyDefaults(Target, Defaults)
+	for Key in next, Target do
+		Target[Key] = nil
+	end
+
+	for Key, Value in next, Defaults do
+		Target[Key] = Value
+	end
+end
+
+Environment.Functions = {}
+
+function Environment.Functions:Exit()
+	for _, Connection in next, ServiceConnections do
+		Connection:Disconnect()
+	end
+
+	Running = false
+	CancelLock()
+
+	if Environment.FOVCircle then
+		Environment.FOVCircle:Remove()
+	end
+
+	local Hub = getgenv().AirHub
+
+	if Hub then
+		Hub.Aimbot = nil
+	end
+
+	Load = nil; ConvertVector = nil; CancelLock = nil; GetClosestPlayer = nil
+end
+
+function Environment.Functions:Restart()
+	for _, Connection in next, ServiceConnections do
+		Connection:Disconnect()
+	end
+
+	Running = false
+	CancelLock()
+
+	Load()
+end
+
+function Environment.Functions:ResetSettings()
+	-- The hub wires CustomTeamCheck once at startup; keep it so team checks
+	-- still work after a reset. IgnoredPlayers is cleared in place so external
+	-- references keep pointing at a live table.
+	local CustomTeamCheck = Environment.Settings.CustomTeamCheck
+
+	ApplyDefaults(Environment.Settings, DefaultSettings)
+	ApplyDefaults(Environment.FOVSettings, DefaultFOVSettings)
+
+	Environment.Settings.CustomTeamCheck = CustomTeamCheck
+
+	if type(Environment.Settings.IgnoredPlayers) ~= "table" then
+		Environment.Settings.IgnoredPlayers = {}
+	else
+		table.clear(Environment.Settings.IgnoredPlayers)
+	end
+
+	Running = false
+	CancelLock()
+end
+
+setmetatable(Environment.Functions, {
+	__newindex = warn
+})
+
+--// Load
+
+Load()
